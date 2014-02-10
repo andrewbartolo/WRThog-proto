@@ -1,6 +1,6 @@
-WRThog
+WRThog-proto
 --------------
-Router + internet appliance penetration testing tool.  Tests HTTP webadmin default logins across a wide range of devices.
+Written in node.js (prototype, see WRThog).  Router + internet appliance penetration testing tool.  Tests HTTP webadmin default logins across a wide range of devices.
 
 Dependencies
 --------------
